@@ -1,0 +1,296 @@
+// WORLD: MAIN — runs in the page context, with direct access to window
+// run_at: document_start — before any page JS
+(function() {
+  'use strict';
+
+  const state = { glb: null, textures: [], modelName: '', status: 'idle' };
+
+  // ── Patch Worker ────────────────────────────────────────────────────────────
+  // Intercepts new Worker('/resource/decrypt/loader-worker.min.js')
+  const _Worker = window.Worker;
+
+  class PatchedWorker extends _Worker {
+    constructor(url, opts) {
+      super(url, opts);
+      const urlStr = (typeof url === 'string') ? url : String(url);
+      if (!urlStr.includes('loader-worker')) return;
+
+      console.log('[Meshy DL] 🎯 Decrypt worker detected:', urlStr);
+
+      // Intercept onmessage via defineProperty
+      let _handler = null;
+      const self = this;
+
+      Object.defineProperty(this, 'onmessage', {
+        get() { return _handler; },
+        set(fn) {
+          _handler = function(ev) {
+            tryIntercept(ev.data);
+            return fn.call(self, ev);
+          };
+          Object.getOwnPropertyDescriptor(_Worker.prototype, 'onmessage')?.set?.call(self, _handler);
+        },
+        configurable: true
+      });
+
+      // Also intercept addEventListener
+      const origAEL = this.addEventListener.bind(this);
+      this.addEventListener = function(type, fn, opts) {
+        if (type === 'message') {
+          return origAEL(type, function(ev) {
+            tryIntercept(ev.data);
+            return fn.call(this, ev);
+          }, opts);
+        }
+        return origAEL(type, fn, opts);
+      };
+    }
+  }
+
+  window.Worker = PatchedWorker;
+
+  // ── Intercept message data ──────────────────────────────────────────────────
+  function buffersAreEqual(a, b) {
+    if (!a || !b || a.byteLength !== b.byteLength) return false;
+    const u1 = new Uint8Array(a);
+    const u2 = new Uint8Array(b);
+    for (let i = 0; i < u1.length; i++) {
+      if (u1[i] !== u2[i]) return false;
+    }
+    return true;
+  }
+
+  function tryIntercept(data) {
+    if (!data || data.type !== 'process' || !data.success) return;
+    const buf = data.data;
+    if (!buf || buf.byteLength < 4) return;
+
+    const magic = String.fromCharCode(...new Uint8Array(buf, 0, 4));
+    if (magic !== 'glTF') {
+      console.log('[Meshy DL] Process message received but magic =', magic);
+      return;
+    }
+
+    const newGlb = buf.slice(0);
+    if (state.glb && buffersAreEqual(state.glb, newGlb)) return;
+
+    const replacing = !!state.glb;
+    if (replacing) {
+      console.log('[Meshy DL] 🔄 New model detected, resetting textures');
+      state.textures = [];
+    }
+
+    state.glb = newGlb;
+    state.modelName = getModelName();
+    state.status = 'ready';
+    console.log('[Meshy DL] ✅ GLB intercepted!', (buf.byteLength/1024/1024).toFixed(2), 'MB');
+
+    saveToIDB({ clearFirst: replacing }).then(() => {
+      updateBtn();
+      window.dispatchEvent(new CustomEvent('__meshyDLReady'));
+    });
+  }
+
+  // ── Patch fetch for textures ───────────────────────────────────────────────
+  const _fetch = window.fetch;
+  window.fetch = async function(...args) {
+    const resp = await _fetch.apply(this, args);
+    const url = typeof args[0] === 'string' ? args[0] : (args[0]?.url || '');
+
+    if (url.includes('assets.meshy.ai') && url.includes('.png')) {
+      resp.clone().arrayBuffer().then(buf => {
+        const name = url.split('/').pop().split('?')[0];
+        if (!state.textures.find(t => t.name === name)) {
+          state.textures.push({ name, buf: buf.slice(0) });
+          console.log('[Meshy DL] 🖼️ Texture:', name, (buf.byteLength/1024).toFixed(0), 'KB');
+          saveToIDB();
+        }
+      }).catch(() => {});
+    }
+    return resp;
+  };
+
+  // ── Helpers ────────────────────────────────────────────────────────────────
+  function getModelName() {
+    const h1 = document.querySelector('h1');
+    if (h1?.textContent) return h1.textContent.trim().replace(/[^\w\-. ]/g, '_').trim() || 'model';
+    return document.title.split('|')[0].trim().replace(/[^\w\-. ]/g, '_') || 'model';
+  }
+
+  // ── IndexedDB ──────────────────────────────────────────────────────────────
+  let _db = null;
+  function openDB() {
+    return new Promise((res, rej) => {
+      if (_db) { res(_db); return; }
+      const r = indexedDB.open('meshy_dl', 2);
+      r.onupgradeneeded = e => {
+        const d = e.target.result;
+        if (!d.objectStoreNames.contains('files')) d.createObjectStore('files');
+      };
+      r.onsuccess = e => { _db = e.target.result; res(_db); };
+      r.onerror = rej;
+    });
+  }
+
+  async function saveToIDB({ clearFirst = false } = {}) {
+    const db = await openDB();
+    const tx = db.transaction('files', 'readwrite');
+    const s = tx.objectStore('files');
+    if (clearFirst) s.clear();
+    if (state.glb)       s.put(state.glb, 'glb');
+    if (state.modelName) s.put(state.modelName, 'modelName');
+    s.put(state.textures.map(t => t.name), 'texNames');
+    for (const tex of state.textures) s.put(tex.buf, 'tex_' + tex.name);
+    s.put({ status: state.status, glbSize: state.glb?.byteLength || 0, texCount: state.textures.length, modelName: state.modelName }, 'meta');
+    return new Promise((res, rej) => { tx.oncomplete = res; tx.onerror = rej; });
+  }
+
+  function loadButtonPosition() {
+    try {
+      const saved = localStorage.getItem('__meshyDLBtnPos');
+      if (!saved) return null;
+      const pos = JSON.parse(saved);
+      if (typeof pos.left !== 'number' || typeof pos.top !== 'number') return null;
+      return pos;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function saveButtonPosition(pos) {
+    try {
+      localStorage.setItem('__meshyDLBtnPos', JSON.stringify(pos));
+    } catch (e) {}
+  }
+
+  // ── Floating button ────────────────────────────────────────────────────────
+  function injectBtn() {
+    if (document.getElementById('__meshyDLBtn')) return;
+    const btn = document.createElement('div');
+    btn.id = '__meshyDLBtn';
+    btn.textContent = '⏳ Meshy DL';
+    btn.style.cssText = `
+      position:fixed;z-index:2147483647;
+      background:#333;color:#fff;font:bold 13px monospace;
+      padding:10px 16px;border-radius:8px;cursor:grab;
+      box-shadow:0 4px 20px rgba(0,0,0,.5);transition:background .2s,border .2s;
+      border:2px solid #555;user-select:none;touch-action:none;
+    `;
+
+    const savedPos = loadButtonPosition();
+    if (savedPos) {
+      btn.style.left = savedPos.left + 'px';
+      btn.style.top = savedPos.top + 'px';
+    } else {
+      btn.style.right = '20px';
+      btn.style.bottom = '20px';
+    }
+
+    const DRAG_THRESHOLD = 5;
+    let dragStart = null;
+    let origin = null;
+    let didDrag = false;
+
+    function endDrag(event) {
+      if (!dragStart) return false;
+      if (event) {
+        event.preventDefault();
+        try { btn.releasePointerCapture(event.pointerId); } catch (e) {}
+      }
+      btn.style.cursor = 'grab';
+      btn.style.transition = 'background .2s,border .2s';
+      const wasDrag = didDrag;
+      dragStart = null;
+      origin = null;
+      if (wasDrag) saveButtonPosition({ left: btn.offsetLeft, top: btn.offsetTop });
+      return wasDrag;
+    }
+
+    btn.addEventListener('pointerdown', event => {
+      if (event.button !== 0) return;
+      event.preventDefault();
+      btn.setPointerCapture(event.pointerId);
+      btn.style.cursor = 'grabbing';
+      btn.style.transition = 'none';
+      didDrag = false;
+
+      const rect = btn.getBoundingClientRect();
+      origin = { x: rect.left, y: rect.top };
+      dragStart = { x: event.clientX, y: event.clientY };
+    });
+
+    btn.addEventListener('pointermove', event => {
+      if (!dragStart) return;
+      event.preventDefault();
+      const dx = event.clientX - dragStart.x;
+      const dy = event.clientY - dragStart.y;
+      if (Math.abs(dx) > DRAG_THRESHOLD || Math.abs(dy) > DRAG_THRESHOLD) didDrag = true;
+      const left = Math.max(0, Math.min(window.innerWidth - btn.offsetWidth, origin.x + dx));
+      const top = Math.max(0, Math.min(window.innerHeight - btn.offsetHeight, origin.y + dy));
+      btn.style.left = left + 'px';
+      btn.style.top = top + 'px';
+      btn.style.right = 'auto';
+      btn.style.bottom = 'auto';
+    });
+
+    btn.addEventListener('pointerup', event => {
+      const wasDrag = endDrag(event);
+      if (wasDrag) return;
+      if (state.status !== 'ready') {
+        btn.textContent = '⏳ Not ready yet...';
+        return;
+      }
+      downloadAll();
+    });
+
+    btn.addEventListener('pointercancel', () => {
+      endDrag();
+    });
+
+    window.addEventListener('__meshyDLReady', () => {
+      const texInfo = state.textures.length > 0 ? ` + ${state.textures.length} tex` : '';
+      btn.textContent = `⬇️ GLB${texInfo} — Download`;
+      btn.style.background = '#1f6feb';
+      btn.style.border = '2px solid #58a6ff';
+    });
+
+    document.body?.appendChild(btn);
+  }
+
+  function downloadAll() {
+    if (state.glb) dl(state.glb, state.modelName + '.glb', 'model/gltf-binary');
+    state.textures.forEach((t, i) =>
+      setTimeout(() => dl(t.buf, t.name, 'image/png'), 300 * (i + 1))
+    );
+  }
+
+  function dl(buf, name, mime) {
+    const url = URL.createObjectURL(new Blob([buf], { type: mime }));
+    const a = Object.assign(document.createElement('a'), {
+      href: url,
+      download: name
+    });
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+  }
+
+  function updateBtn() {
+    const btn = document.getElementById('__meshyDLBtn');
+    if (btn) {
+      const texInfo = state.textures.length > 0 ? ` + ${state.textures.length} tex` : '';
+      btn.textContent = `⬇️ GLB${texInfo} — Download`;
+      btn.style.background = '#1f6feb';
+      btn.style.border = '2px solid #58a6ff';
+    }
+  }
+
+  // Wait until body is available
+  if (document.body) injectBtn();
+  else new MutationObserver((_, obs) => {
+    if (document.body) { injectBtn(); obs.disconnect(); }
+  }).observe(document.documentElement, { childList: true });
+
+  console.log('[Meshy DL] ✅ Extension loaded (MAIN world, document_start)');
+})();
